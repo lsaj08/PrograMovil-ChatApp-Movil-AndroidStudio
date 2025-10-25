@@ -3,7 +3,6 @@ package com.ulatina.chatapp.signalr
 import android.util.Log
 import com.microsoft.signalr.HubConnection
 import com.microsoft.signalr.HubConnectionBuilder
-import com.microsoft.signalr.HubConnectionState
 import io.reactivex.rxjava3.core.Single
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -11,106 +10,82 @@ import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
-import java.net.URLEncoder
-import java.util.concurrent.TimeUnit
 
-class ChatHubConnection {
+class ChatHubConnection(
+    private val negotiateUrl: String
+) {
+    private val TAG = "SignalR"
+    private var hub: HubConnection? = null
 
-    private var hubConnection: HubConnection? = null
-
-    companion object {
-        private const val TAG = "SignalR"
-        // Local dev: tu backend corriendo con dotnet run
-        private const val NEGOTIATE_URL = "http://10.0.2.2:5242/negotiate"
-    }
-
-    private val http by lazy {
-        OkHttpClient.Builder()
-            .connectTimeout(20, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .writeTimeout(30, TimeUnit.SECONDS)
-            .build()
-    }
-
-    fun connect(username: String? = null) {
+    /**
+     * Conecta y registra handlers:
+     *  - onCipherOrKey: recibe payloads String de ReceivePublicKey / ReceiveCipher
+     *  - onPlain: recibe mensajes legacy en claro (JSONObject)
+     */
+    fun connect(
+        onConnected: (() -> Unit)? = null,
+        onCipherOrKey: (String) -> Unit,
+        onPlain: ((JSONObject) -> Unit)? = null
+    ) {
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                Log.i(TAG, "🌐 Solicitando negotiate desde $NEGOTIATE_URL")
-                val req = Request.Builder().url(NEGOTIATE_URL).build()
-                val res = http.newCall(req).execute()
-                if (!res.isSuccessful) {
-                    Log.e(TAG, "❌ Error en negotiate: HTTP ${res.code}")
-                    return@launch
+                Log.i(TAG, "🌐 Solicitando negotiate: $negotiateUrl")
+                val client = OkHttpClient()
+                val req = Request.Builder().url(negotiateUrl).build()
+                client.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        Log.e(TAG, "❌ negotiate HTTP ${resp.code}")
+                        return@launch
+                    }
+                    val body = resp.body?.string().orEmpty()
+                    val obj = JSONObject(body)
+                    val url = obj.getString("url")
+                    val token = obj.getString("accessToken")
+
+                    hub = HubConnectionBuilder.create(url)
+                        .withAccessTokenProvider(Single.fromCallable { token })
+                        .build()
+
+                    // E2EE: claves públicas y cifrados
+                    hub?.on("ReceivePublicKey", { payload: String -> onCipherOrKey(payload) }, String::class.java)
+                    hub?.on("ReceiveCipher",    { payload: String -> onCipherOrKey(payload) }, String::class.java)
+
+                    // Legacy plaintext (por compatibilidad con web si aún manda en claro)
+                    onPlain?.let {
+                        hub?.on("ReceiveMessage", { json: JSONObject -> it(json) }, JSONObject::class.java)
+                    }
+
+                    hub?.start()?.blockingAwait()
+                    Log.i(TAG, "✅ Conectado a Azure SignalR (canales E2EE listos).")
+                    onConnected?.invoke()
                 }
-                val body = res.body?.string()
-                if (body.isNullOrEmpty()) {
-                    Log.e(TAG, "❌ Respuesta vacía del negotiate.")
-                    return@launch
-                }
-
-                val json = JSONObject(body)
-                var url = json.getString("url")
-                val accessToken = json.getString("accessToken")
-
-                // (Opcional) pasa el username como query si tu Hub lo usa
-                if (!username.isNullOrBlank()) {
-                    val encoded = URLEncoder.encode(username, "UTF-8")
-                    url = if (url.contains("?")) "$url&username=$encoded" else "$url?username=$encoded"
-                }
-
-                hubConnection = HubConnectionBuilder.create(url)
-                    .withAccessTokenProvider(Single.fromCallable { accessToken })
-                    .build()
-
-                // Listener de mensajes
-                hubConnection?.on("ReceiveMessage", { payload: JSONObject ->
-                    val user = payload.optString("user")
-                    val message = payload.optString("message")
-                    val fecha = payload.optString("fechaHoraCostaRica")
-                    Log.i(TAG, "💬 [$fecha] $user: $message")
-                }, JSONObject::class.java)
-
-                // Log en cierre
-                hubConnection?.onClosed { error ->
-                    Log.w(TAG, "🔌 Conexión cerrada: ${error?.message}")
-                }
-
-                // Inicia conexión con manejo de errores (evita OnErrorNotImplementedException)
-                hubConnection?.start()
-                    ?.subscribe(
-                        { Log.i(TAG, "✅ Conectado exitosamente al hub en Azure.") },
-                        { e -> Log.e(TAG, "❌ Error al conectar: ${e.message}", e) }
-                    )
-
-            } catch (t: Throwable) {
-                Log.e(TAG, "❌ Excepción conectando: ${t.message}", t)
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ Error conectando", e)
             }
         }
     }
 
-    fun isConnected(): Boolean =
-        hubConnection?.connectionState == HubConnectionState.CONNECTED
-
-    fun sendMessage(user: String, message: String) {
+    /** Enviar JSON (SharePublicKey / SendCipher) */
+    fun sendJson(method: String, payloadJson: String) {
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                if (!isConnected()) {
-                    Log.e(TAG, "⚠️ No hay conexión activa al hub (estado=${hubConnection?.connectionState}).")
-                    return@launch
-                }
-                hubConnection?.send("SendMessage", user, message)
-                Log.i(TAG, "📤 Enviado: $user -> $message")
-            } catch (t: Throwable) {
-                Log.e(TAG, "❌ Error al enviar mensaje: ${t.message}", t)
+                hub?.send(method, payloadJson)
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ sendJson error", e)
             }
         }
     }
 
-    fun disconnect() {
-        hubConnection?.stop()
-            ?.subscribe(
-                { Log.i(TAG, "🔌 Conexión detenida correctamente.") },
-                { e -> Log.e(TAG, "❌ Error al detener conexión: ${e.message}", e) }
-            )
+    /** Enviar plaintext (compatibilidad con tu método SendMessage(user, message)) */
+    fun sendPlain(method: String, vararg args: Any) {
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                hub?.send(method, *args)
+            } catch (e: Exception) {
+                Log.e(TAG, "❌ sendPlain error", e)
+            }
+        }
     }
+
+    fun stop() { try { hub?.stop() } catch (_: Exception) {} }
 }
